@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::agent::{noop_sink, schema_object, Agent, AgentBuilder, EventSink};
+use crate::agent::{noop_sink, schema_object, Agent, AgentBuilder, AgentEvent, EventSink};
 use crate::model::{ModelClient, ToolDef};
 use crate::prompts;
 use crate::tools::bash::BashTool;
@@ -145,7 +145,7 @@ impl HandoffTool {
         first: bool,
         brief: String,
         deliver_async: bool,
-    ) -> JoinHandle<String> {
+    ) -> JoinHandle<(String, bool)> {
         let mut agent = match agent {
             Some(a) => a,
             None => {
@@ -157,10 +157,14 @@ impl HandoffTool {
         let slot = Arc::clone(&self.slot);
         let lead_tx = self.lead_tx.clone();
         let wrapped = prompts::wrap_brief(first, &brief);
+        let events = self.factory.events.clone();
         tokio::spawn(async move {
-            let report = match agent.run_turn(wrapped).await {
-                Ok(r) => r,
-                Err(e) => format!("Handoff failed: {e:#}"),
+            let (report, failed) = match agent.run_turn(wrapped).await {
+                Ok(r) => (r, false),
+                Err(e) => {
+                    (events)("sidekick", AgentEvent::Error(format!("{e:#}")));
+                    (format!("Handoff failed: {e:#}"), true)
+                }
             };
             {
                 let mut slot = slot.lock().unwrap();
@@ -172,7 +176,7 @@ impl HandoffTool {
             if deliver_async {
                 let _ = lead_tx.send(prompts::wrap_report(&report)).await;
             }
-            report
+            (report, failed)
         })
     }
 }
@@ -262,9 +266,10 @@ impl Tool for HandoffTool {
 
         if block {
             match handle.await {
-                Ok(report) => {
+                Ok((report, false)) => {
                     ToolOutput::ok(format!("Sidekick completed the handoff:\n\n{report}"))
                 }
+                Ok((report, true)) => ToolOutput::err(report),
                 Err(e) => ToolOutput::err(format!("Handoff task failed: {e}")),
             }
         } else {

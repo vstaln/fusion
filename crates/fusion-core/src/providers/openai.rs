@@ -100,7 +100,13 @@ impl ModelClient for OpenAiClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            bail!("openai {}: {}", status, &text[..text.len().min(500)]);
+            let body_dbg = body.to_string();
+            bail!(
+                "openai {}: {}\nrequest: {}",
+                status,
+                &text[..text.len().min(400)],
+                &body_dbg[..body_dbg.len().min(3000)]
+            );
         }
         let v: Value = serde_json::from_str(&text)?;
         let msg = &v["choices"][0]["message"];

@@ -40,6 +40,7 @@ fn event_sink() -> fusion_core::EventSink {
             }
             AgentEvent::Injected(m) => eprintln!("  {tag} ⇐ injected: {}", &m[..m.len().min(120)]),
             AgentEvent::Note(m) => eprintln!("  {tag} ⚠ nudge: {}", &m[..m.len().min(120)]),
+            AgentEvent::Error(m) => eprintln!("  {tag} ✗ error: {}", &m[..m.len().min(400)]),
             AgentEvent::Text(_) => {}
         }
     })

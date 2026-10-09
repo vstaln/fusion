@@ -37,7 +37,10 @@ user ──► lead ──(handoff {brief, block})──► sidekick (persistent
 
 - `crates/fusion-core` — the library: `FusionBuilder`/`Fusion`,
   `handoff` + `wait` + bash tools, agent loop with an injection inbox,
-  Anthropic + OpenAI-compatible providers, scripted `mock` for tests.
+  Anthropic + OpenAI-compatible providers, an **ACP provider**
+  (`acp:<model>` — drives subscription models like SWE-2 through a
+  persistent `devin acp` child, tools riding as fenced `tool_call`
+  text blocks), scripted `mock` for tests.
 - `crates/fusion-cli` — reference REPL/one-shot CLI.
 
 ## Usage
@@ -51,6 +54,19 @@ $ cargo run -p fusion-cli -- \
 ```
 
 `OPENAI_BASE_URL` covers OpenRouter/Ollama/etc. Omit the prompt for a REPL.
+
+Subscription models (e.g. SWE-2 via a Devin login) use the `acp` provider:
+
+```console
+$ cargo run -p fusion-cli -- \
+    --lead openai:step-5-preview \
+    --sidekick acp:swe-2 "..."
+```
+
+Each `acp:` client is a persistent `devin acp` child (initialize →
+session/new → delta session/prompts) with every native Devin tool denied;
+our tools ride as fenced `tool_call` JSON blocks and a bounded
+continuation nudge recovers premature stops.
 
 Embed it:
 

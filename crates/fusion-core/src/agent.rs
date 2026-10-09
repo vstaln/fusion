@@ -23,6 +23,7 @@ pub enum AgentEvent {
     },
     Injected(String),
     Note(String),
+    Error(String),
 }
 
 pub type EventSink = Arc<dyn Fn(&str, AgentEvent) + Send + Sync>;
