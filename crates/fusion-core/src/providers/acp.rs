@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
-use crate::model::{Completion, Content, Message, ModelClient, Request, Role};
+use crate::model::{Completion, Content, ModelClient, Request, Role};
 
 const DENY_RULES: &[&str] = &[
     "read",
@@ -42,6 +42,8 @@ pub fn tool_spec_text(tools: &[crate::model::ToolDef]) -> String {
          - When results arrive, continue emitting tool_call blocks until the task is \
          done. A reply with NO block is your FINAL report and ends the task — only \
          stop emitting calls when you are actually finished.\n\
+         - A reply that describes a future action ('I'll run X', 'Let me check') but \
+         has no block DOES NOTHING. If your next step is an action, emit the block.\n\
          Available tools:\n",
     );
     for t in tools {
@@ -54,14 +56,29 @@ pub fn tool_spec_text(tools: &[crate::model::ToolDef]) -> String {
 }
 
 /// Parse fenced ```tool_call blocks out of model text.
-fn parse_tool_calls(text: &str, next_id: &mut usize) -> (String, Vec<Content>) {
+/// Returns (plain text, calls, malformed) — malformed means a tool_call
+/// fence opened but never closed and its tail did not parse as JSON.
+fn parse_tool_calls(text: &str, next_id: &mut usize) -> (String, Vec<Content>, bool) {
     let mut calls = Vec::new();
     let mut plain = String::new();
+    let mut malformed = false;
     let mut rest = text;
     while let Some(start) = rest.find("```tool_call") {
         plain.push_str(&rest[..start]);
         rest = &rest[start + "```tool_call".len()..];
-        match rest.find("```") {
+        let close = rest.match_indices("```").find_map(|(i, _)| {
+            let before_ok = i == 0 || rest.as_bytes()[i - 1] == b'\n';
+            let after = &rest[i + 3..];
+            let after_ok = after.is_empty()
+                || after
+                    .chars()
+                    .next()
+                    .map(|ch| ch == '\n' || ch == '\r')
+                    .unwrap_or(false)
+                || after.trim_start_matches([' ', '\t']).starts_with('\n');
+            (before_ok && after_ok).then_some(i)
+        });
+        match close {
             Some(end) => {
                 let body = rest[..end].trim();
                 rest = &rest[end + 3..];
@@ -81,14 +98,48 @@ fn parse_tool_calls(text: &str, next_id: &mut usize) -> (String, Vec<Content>) {
                 }
             }
             None => {
-                plain.push_str("```tool_call");
-                plain.push_str(rest);
+                // Unclosed fence (truncated reply / forgotten closing ```).
+                // Salvage: if the tail parses as JSON, take the calls anyway.
+                let tail = rest.trim();
+                match serde_json::from_str::<Value>(tail) {
+                    Ok(Value::Array(items)) => {
+                        for item in items {
+                            push_call(item, &mut calls, next_id);
+                        }
+                    }
+                    Ok(item @ Value::Object(_)) => push_call(item, &mut calls, next_id),
+                    _ => {
+                        malformed = true;
+                        plain.push_str("```tool_call");
+                        plain.push_str(rest);
+                    }
+                }
                 rest = "";
             }
         }
     }
     plain.push_str(rest);
-    (plain.trim().to_string(), calls)
+    (plain.trim().to_string(), calls, malformed)
+}
+
+/// Stated intent or a forward reference ("the brief below") with no
+/// emitted call. Scans the whole text — false positives cost one bounded
+/// retry, a miss silently ends the task.
+fn looks_like_intent(text: &str) -> bool {
+    let t: String = text.chars().take(4000).collect::<String>().to_lowercase();
+    let tail = t.trim_end();
+    const MARKERS: &[&str] = &[
+        "i'll", "i will", "i'd ", "let me", "going to", "gonna ",
+        "now i ", "next i", "i need to", "i plan", "my plan",
+        "i'm delegat", "delegat",
+        "the brief", "the following", "as follows", "below:", "below —",
+        "see below", "i've settled", "settled the design", "dispatch",
+        "re-send", "i will now", "about to",
+    ];
+    if MARKERS.iter().any(|m| t.contains(m)) {
+        return true;
+    }
+    tail.ends_with(':') || tail.ends_with("below") || tail.ends_with('—')
 }
 
 fn push_call(item: Value, calls: &mut Vec<Content>, next_id: &mut usize) {
@@ -135,7 +186,7 @@ fn scratch_stage() -> anyhow::Result<std::path::PathBuf> {
 }
 
 impl Child_ {
-    async fn spawn(model: &str) -> anyhow::Result<Self> {
+    async fn spawn(model: &str, workdir: &std::path::Path) -> anyhow::Result<Self> {
         let binary = std::env::var("FUSION_ACP_COMMAND").unwrap_or_else(|_| "devin".into());
         let stage = scratch_stage()?;
         let mut proc = Command::new(&binary)
@@ -146,7 +197,7 @@ impl Child_ {
                 "--model",
                 model,
             ])
-            .current_dir(&stage)
+            .current_dir(workdir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -266,6 +317,7 @@ impl Child_ {
 
 pub struct AcpClient {
     model: String,
+    workdir: std::path::PathBuf,
     child: tokio::sync::Mutex<Option<Child_>>,
     call_counter: Mutex<usize>,
     /// Index into the history: user messages below this line were already
@@ -277,9 +329,10 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
-    pub fn new(model: impl Into<String>) -> Self {
+    pub fn new(model: impl Into<String>, workdir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             model: model.into(),
+            workdir: workdir.into(),
             child: tokio::sync::Mutex::new(None),
             call_counter: Mutex::new(0),
             sent_up_to: Mutex::new(0),
@@ -296,9 +349,11 @@ impl AcpClient {
         let mut has_results = false;
         if !*self.system_sent.lock().unwrap() {
             parts.push(format!(
-                "<system>\n{}{}\n</system>",
+                "<system>\n{}{}\n\n## Working directory\n{}\n\
+                 Run all commands there — `cd` first or use absolute paths.\n</system>",
                 req.system,
-                tool_spec_text(req.tools)
+                tool_spec_text(req.tools),
+                self.workdir.display()
             ));
             *self.system_sent.lock().unwrap() = true;
         }
@@ -335,7 +390,7 @@ impl ModelClient for AcpClient {
         // One prompt in flight per child; serialize via the child mutex.
         let mut guard = self.child.lock().await;
         if guard.is_none() {
-            let mut c = Child_::spawn(&self.model).await?;
+            let mut c = Child_::spawn(&self.model, &self.workdir).await?;
             c.call(
                 "initialize",
                 json!({"protocolVersion": 1,
@@ -348,7 +403,7 @@ impl ModelClient for AcpClient {
             let new = c
                 .call(
                     "session/new",
-                    json!({"cwd": std::env::temp_dir().join(format!("fusion-acp-{}", std::process::id())), "mcpServers": []}),
+                    json!({"cwd": self.workdir, "mcpServers": []}),
                     None,
                     Duration::from_secs(60),
                 )
@@ -376,6 +431,7 @@ impl ModelClient for AcpClient {
         // Protocol recovery: a reply with no tool_call block mid-task is a
         // premature stop — nudge the model to continue (bounded).
         let mut result = json!(null);
+        let mut malformed_last = false;
         for attempt in 0..3 {
             text.clear();
             result = c
@@ -390,16 +446,27 @@ impl ModelClient for AcpClient {
             if stop == "refusal" {
                 bail!("devin refused this request (usage policy)");
             }
-            let has_calls = {
+            let no_calls = {
                 let mut n = self.call_counter.lock().unwrap();
-                let (_, calls) = parse_tool_calls(&text, &mut n);
-                !calls.is_empty()
+                let (_, calls, mal) = parse_tool_calls(&text, &mut n);
+                // malformed blocks can't be salvaged: force a retry.
+                malformed_last = mal;
+                calls.is_empty()
             };
-            if has_calls || (!mid_task && !text.trim().is_empty()) {
+            let premature = no_calls
+                && (malformed_last
+                    || text.trim().is_empty()
+                    || mid_task
+                    || looks_like_intent(&text));
+            if !premature {
                 break;
             }
             mid_task = false;
-            prompt = if text.trim().is_empty() {
+            prompt = if malformed_last {
+                "Your ```tool_call block was never closed (the reply ended inside it) and its \
+                 JSON did not parse. Re-emit the entire block, ending with a line that is only ```."
+                    .to_string()
+            } else if text.trim().is_empty() {
                 "Your reply was empty. To act, emit a fenced ```tool_call block at the                  end of your reply; to finish, write your final report."
                     .to_string()
             } else {
@@ -409,7 +476,7 @@ impl ModelClient for AcpClient {
             let _ = attempt;
         }
         let stop = result["stopReason"].as_str().unwrap_or_default();
-        let (plain, calls) = {
+        let (plain, calls, _) = {
             let mut n = self.call_counter.lock().unwrap();
             parse_tool_calls(&text, &mut n)
         };

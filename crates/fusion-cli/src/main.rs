@@ -54,8 +54,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cwd = std::fs::canonicalize(&args.cwd)?;
     let mut fusion = FusionBuilder::new(
-        client_from_spec(&args.lead)?,
-        client_from_spec(&args.sidekick)?,
+        client_from_spec(&args.lead, &cwd)?,
+        client_from_spec(&args.sidekick, &cwd)?,
         cwd.clone(),
     )
     .lead_identity("fusion")

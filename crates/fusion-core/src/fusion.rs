@@ -468,8 +468,31 @@ impl FusionBuilder {
 
 impl Fusion {
     /// Run one user turn on the lead. Returns the lead's final text.
+    ///
+    /// A `block: false` handoff can still be running when the lead stops.
+    /// Its report lands in the lead inbox on completion — wait for it and
+    /// let the lead react rather than losing the work at end of turn.
     pub async fn run(&mut self, input: impl Into<String>) -> anyhow::Result<String> {
-        self.lead.run_turn(input).await
+        let mut out = self.lead.run_turn(input).await?;
+        for _ in 0..4 {
+            let notify = {
+                let slot = self.slot.lock().unwrap();
+                if !slot.running {
+                    return Ok(out);
+                }
+                slot.finished.clone()
+            };
+            let mut wait = Box::pin(notify.notified());
+            wait.as_mut().enable();
+            if tokio::time::timeout(Duration::from_secs(600), wait)
+                .await
+                .is_err()
+            {
+                return Ok(out); // sidekick wedged — don't hang the run
+            }
+            out = self.lead.resume().await?;
+        }
+        Ok(out)
     }
 
     /// Channel for external steering: anything sent here lands in the

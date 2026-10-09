@@ -146,6 +146,16 @@ impl Agent {
     /// between iterations.
     pub async fn run_turn(&mut self, input: impl Into<String>) -> anyhow::Result<String> {
         self.history.push(Message::text(Role::User, input.into()));
+        self.drive().await
+    }
+
+    /// Re-enter the loop without new user input — for when an inbox
+    /// notification (e.g. an async sidekick report) should re-wake the agent.
+    pub async fn resume(&mut self) -> anyhow::Result<String> {
+        self.drive().await
+    }
+
+    async fn drive(&mut self) -> anyhow::Result<String> {
         for _ in 0..self.max_iterations {
             self.drain_pending();
             let completion = self
