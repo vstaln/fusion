@@ -26,11 +26,13 @@ fn truncate(s: &str) -> String {
         return s.to_string();
     }
     let keep = OUTPUT_LIMIT / 2;
+    let start = s.floor_char_boundary(keep);
+    let end = s.ceil_char_boundary(s.len() - keep);
     format!(
         "{}\n\n[... {} bytes truncated ...]\n\n{}",
-        &s[..keep],
-        s.len() - 2 * keep,
-        &s[s.len() - keep..]
+        &s[..start],
+        end - start,
+        &s[end..]
     )
 }
 
